@@ -1,6 +1,6 @@
 {
     "name": "argo-codec",
-    "version": "0.2.0",
+    "version": "0.2.1",
     "description": "Fast, zero-copy TypeScript implementation of the Argo binary serialization format for GraphQL.",
     "keywords": [
         "argo",
@@ -39,7 +39,6 @@
     "sideEffects": false,
     "files": [
         "dist",
-        "src",
         "README.md",
         "LICENSE"
     ],
