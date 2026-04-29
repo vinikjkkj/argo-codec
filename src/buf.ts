@@ -60,6 +60,24 @@ export class Buf {
         this.uvarint(z)
     }
 
+    // Variable-length BitSet used for the message Header (and UserFlags).
+    // Layout per byte: data bits in positions 7..1, LSB (bit 0) is the continuation flag
+    // (1 = more bytes follow). Empty bitset (n=0) still emits one zero byte.
+    bitset(n: number) {
+        let more = n > 0
+        if (!more) {
+            this.byte(0)
+            return
+        }
+        while (more) {
+            let byte = (n & 0x7f) << 1
+            n = Math.floor(n / 128)
+            more = n > 0
+            if (more) byte |= 1
+            this.byte(byte)
+        }
+    }
+
     // Big varint (for full 64-bit values via bigint). Used only when number cannot represent.
     uvarintBig(n: bigint) {
         while (n >= 0x80n) {
@@ -132,6 +150,21 @@ export class Reader {
     label(): number {
         const z = this.uvarint()
         return z % 2 === 0 ? z / 2 : -((z + 1) / 2)
+    }
+
+    // Read a variable-length BitSet (mirror of Buf.bitset).
+    bitset(): number {
+        let n = 0
+        let bitPos = 0
+        let more = true
+        while (more) {
+            if (this.pos >= this.end) throw new RangeError('Reader: out of bounds')
+            const byte = this.arr[this.pos++]
+            n += (byte >> 1) * 2 ** bitPos
+            bitPos += 7
+            more = (byte & 1) === 1
+        }
+        return n
     }
 
     uvarintBig(): bigint {

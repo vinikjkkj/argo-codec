@@ -30,9 +30,7 @@ import {
 const TEXT_DEC = new TextDecoder('utf-8', { fatal: false })
 
 interface BlockReader {
-    reader: Reader // for FLOAT64/FIXED in non-inline (or the same as core in inline)
-    // In inline mode, STRING/BYTES data is read inline from core after the length label;
-    // in non-inline, we cut subarrays from the block reader, which advances its pos.
+    reader: Reader
     dedupe: boolean
     seen: unknown[]
     nullTerminated: boolean
@@ -41,7 +39,8 @@ interface BlockReader {
 
 class DecoderState {
     blocks = new Map<string, BlockReader>()
-    blockOrder: string[] = []
+    blockSlices: Reader[] = []
+    nextBlockIdx = 0
     core!: Reader
     inline = false
     nullTerminated = false
@@ -49,63 +48,29 @@ class DecoderState {
     selfDescribing = false
     selfDescribingErrors = false
     noDedup = false
-}
 
-function preWalk(t: Wire, st: DecoderState, seen: Set<string>): void {
-    switch (t.type) {
-        case 'BLOCK':
-            if (!seen.has(t.key) && !st.blocks.has(t.key)) {
-                seen.add(t.key)
-                st.blockOrder.push(t.key)
-                // placeholder, real reader installed later
-                st.blocks.set(t.key, {
-                    reader: null!,
-                    dedupe: t.dedupe,
-                    seen: [],
-                    nullTerminated: st.nullTerminated,
-                    inline: st.inline
-                })
-            }
-            preWalk(t.of, st, seen)
-            return
-        case 'NULLABLE':
-        case 'ARRAY':
-            preWalk(t.of, st, seen)
-            return
-        case 'RECORD':
-            for (const f of t.fields) preWalk(f.of, st, seen)
-            return
-        case 'DESC':
-            for (const [k, d] of [
-                ['String', true],
-                ['Bytes', true],
-                ['Int', false],
-                ['Float', false]
-            ] as const) {
-                if (!seen.has(k) && !st.blocks.has(k)) {
-                    seen.add(k)
-                    st.blockOrder.push(k)
-                    st.blocks.set(k, {
-                        reader: null!,
-                        dedupe: d,
-                        seen: [],
-                        nullTerminated: st.nullTerminated,
-                        inline: st.inline
-                    })
-                }
-            }
-            return
-        case 'PATH':
-            return
-        default:
-            return
+    block(key: string, dedupe: boolean): BlockReader {
+        let b = this.blocks.get(key)
+        if (b) return b
+        // First use of this block. In inline mode all blocks share the core reader;
+        // otherwise pull the next slice in encoder-emit order.
+        const r = this.inline ? this.core : this.blockSlices[this.nextBlockIdx++]
+        b = {
+            reader: r,
+            dedupe,
+            seen: [],
+            nullTerminated: this.nullTerminated,
+            inline: this.inline
+        }
+        this.blocks.set(key, b)
+        return b
     }
 }
 
 function readValue(st: DecoderState, t: Wire, block: BlockReader | null): unknown {
     switch (t.type) {
         case 'BLOCK':
-            return readValue(st, t.of, st.blocks.get(t.key)!)
+            return readValue(st, t.of, st.block(t.key, t.dedupe))
 
         case 'NULLABLE': {
             const r = st.core
@@ -113,18 +78,16 @@ function readValue(st: DecoderState, t: Wire, block: BlockReader | null): unknow
             const lab = r.label()
             if (lab === LABEL_NULL) return null
             if (lab === LABEL_ERROR) {
-                // Read ARRAY of error values inline.
                 const len = r.label()
                 const errs: ArgoError[] = []
                 for (let i = 0; i < len; i++) errs.push(readErrorValue(st))
                 return new FieldErrorSentinel(errs)
             }
-            // Not null. Rewind label and decode underlying.
             if (isLabeled(t.of)) {
-                r.pos = start // underlying will re-read the label as part of its decoding
+                r.pos = start
                 return readValue(st, t.of, block)
             }
-            // Underlying Unlabeled: lab was the non-null marker (0); proceed to decode underlying.
+            // Underlying Unlabeled: lab was the non-null marker (0).
             return readValue(st, t.of, block)
         }
 
@@ -132,11 +95,9 @@ function readValue(st: DecoderState, t: Wire, block: BlockReader | null): unknow
             const r = st.core
             const lab = r.label()
             if (lab < BACKREF_BASE + 1) {
-                // Backref (-4, -5, ...)
-                const idx = -lab + BACKREF_BASE // -lab - 4
+                const idx = -lab + BACKREF_BASE
                 return block!.seen[idx]
             }
-            // First occurrence: lab is the byte length
             const data = block!.inline ? r.bytes(lab) : block!.reader.bytes(lab)
             if (block!.nullTerminated) {
                 if (block!.inline) r.pos++
@@ -160,7 +121,8 @@ function readValue(st: DecoderState, t: Wire, block: BlockReader | null): unknow
         }
 
         case 'VARINT':
-            return st.core.label()
+            // Reference-compatible: data lives in the block, no label in core.
+            return block!.reader.label()
 
         case 'BOOLEAN': {
             const lab = st.core.label()
@@ -168,11 +130,10 @@ function readValue(st: DecoderState, t: Wire, block: BlockReader | null): unknow
         }
 
         case 'FLOAT64':
-            return block!.inline ? st.core.f64() : block!.reader.f64()
+            return block!.reader.f64()
 
-        case 'FIXED': {
-            return block!.inline ? st.core.bytes(t.length) : block!.reader.bytes(t.length)
-        }
+        case 'FIXED':
+            return block!.reader.bytes(t.length)
 
         case 'RECORD': {
             const out: Record<string, unknown> = {}
@@ -182,12 +143,10 @@ function readValue(st: DecoderState, t: Wire, block: BlockReader | null): unknow
                     const start = r.pos
                     const lab = r.label()
                     if (lab === LABEL_ABSENT) continue
-                    if (!isLabeled(f.of)) {
-                        // lab was the non-null marker (0); decode underlying
-                    } else {
-                        // The label belongs to the underlying value; rewind.
-                        r.pos = start
+                    if (isLabeled(f.of)) {
+                        r.pos = start // leave label for the value to consume
                     }
+                    // else: lab was the non-null marker (0), already consumed
                 }
                 out[f.name] = readValue(st, f.of, block)
             }
@@ -224,18 +183,20 @@ function readDesc(st: DecoderState): unknown {
         case DESC_TRUE:
             return true
         case DESC_STRING: {
-            const block = st.blocks.get('String')!
+            const block = st.block('String', true)
             return readStringFromBlock(st, block)
         }
         case DESC_BYTES: {
-            const block = st.blocks.get('Bytes')!
+            const block = st.block('Bytes', true)
             return readBytesFromBlock(st, block)
         }
-        case DESC_INT:
-            return r.label()
+        case DESC_INT: {
+            const block = st.block('Int', false)
+            return block.reader.label()
+        }
         case DESC_FLOAT: {
-            const block = st.blocks.get('Float')!
-            return block.inline ? r.f64() : block.reader.f64()
+            const block = st.block('Float', false)
+            return block.reader.f64()
         }
         case DESC_LIST: {
             const len = r.label()
@@ -245,7 +206,7 @@ function readDesc(st: DecoderState): unknown {
         }
         case DESC_OBJECT: {
             const n = r.label()
-            const block = st.blocks.get('String')!
+            const block = st.block('String', true)
             const out: Record<string, unknown> = {}
             for (let i = 0; i < n; i++) {
                 const key = readStringFromBlock(st, block)
@@ -296,7 +257,7 @@ function readErrorValue(st: DecoderState): ArgoError {
 
 export function decode(wire: Wire, message: Uint8Array): unknown {
     const r = new Reader(message)
-    const flags = r.uvarint()
+    const flags = r.bitset()
     const st = new DecoderState()
     st.inline = (flags & FLAG_INLINE_EVERYTHING) !== 0
     st.selfDescribing = (flags & FLAG_SELF_DESCRIBING) !== 0
@@ -304,34 +265,23 @@ export function decode(wire: Wire, message: Uint8Array): unknown {
     st.selfDescribingErrors = (flags & FLAG_SELF_DESCRIBING_ERRORS) !== 0
     st.nullTerminated = (flags & FLAG_NULL_TERMINATED_STRINGS) !== 0
     st.noDedup = (flags & FLAG_NO_DEDUPLICATION) !== 0
-    if (flags & FLAG_HAS_USER_FLAGS) r.uvarint() // skip user flags
-
-    preWalk(wire, st, new Set())
+    if (flags & FLAG_HAS_USER_FLAGS) r.bitset() // skip user flags
 
     if (!st.inline) {
-        for (const key of st.blockOrder) {
+        // Read sequence of length-prefixed segments until EOF. The last is the core.
+        const slices: Reader[] = []
+        while (r.pos < r.end) {
             const len = r.label()
             const slice = r.bytes(len)
-            const b = st.blocks.get(key)!
-            b.reader = new Reader(slice)
-            b.nullTerminated = st.nullTerminated
-            b.inline = false
+            slices.push(new Reader(slice))
         }
-        const coreLen = r.label()
-        const coreSlice = r.bytes(coreLen)
-        st.core = new Reader(coreSlice)
+        if (slices.length === 0) throw new Error('decode: missing core segment')
+        st.core = slices[slices.length - 1]
+        st.blockSlices = slices.slice(0, -1)
     } else {
-        // In inline mode, all data lives in core; "block readers" point at the core too.
+        // Inline mode: everything after the header is the core, and any "block" lookup
+        // resolves to the same reader.
         st.core = r
-        for (const key of st.blockOrder) {
-            st.blocks.set(key, {
-                reader: r,
-                dedupe: st.blocks.get(key)!.dedupe,
-                seen: [],
-                nullTerminated: st.nullTerminated,
-                inline: true
-            })
-        }
     }
 
     if (st.selfDescribing) return readDesc(st)

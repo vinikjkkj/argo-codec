@@ -48,18 +48,16 @@ export const DESC_INT = 6
 export const DESC_FLOAT = 7
 
 // A type is "Labeled" iff its core encoding starts with (or is) a Label.
-// STRING, BYTES, ARRAY, BOOLEAN, VARINT, NULLABLE, DESC, PATH are Labeled.
-// FLOAT64, FIXED, RECORD are Unlabeled.
+// Matches the reference impl: NULLABLE, STRING, BOOLEAN, BYTES, ARRAY are Labeled;
+// VARINT/FLOAT64/FIXED data live in their block (so core has no leading label),
+// DESC/PATH/RECORD are treated as Unlabeled here too.
 export function isLabeled(t: Wire): boolean {
     switch (t.type) {
+        case 'NULLABLE':
         case 'STRING':
+        case 'BOOLEAN':
         case 'BYTES':
         case 'ARRAY':
-        case 'BOOLEAN':
-        case 'VARINT':
-        case 'NULLABLE':
-        case 'DESC':
-        case 'PATH':
             return true
         case 'BLOCK':
             return isLabeled(t.of)

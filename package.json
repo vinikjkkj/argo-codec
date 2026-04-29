@@ -1,6 +1,26 @@
 {
-    "name": "argo-js",
-    "version": "0.1.0",
+    "name": "argo-codec",
+    "version": "0.1.1",
+    "description": "Fast, zero-copy TypeScript implementation of the Argo binary serialization format for GraphQL.",
+    "keywords": [
+        "argo",
+        "graphql",
+        "binary",
+        "serialization",
+        "codec",
+        "encoding",
+        "decoding",
+        "zero-copy"
+    ],
+    "license": "MIT",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/vinikjkkj/argo-codec.git"
+    },
+    "bugs": {
+        "url": "https://github.com/vinikjkkj/argo-codec/issues"
+    },
+    "homepage": "https://github.com/vinikjkkj/argo-codec#readme",
     "type": "module",
     "main": "./dist/index.js",
     "types": "./dist/index.d.ts",
@@ -10,17 +30,41 @@
             "import": "./dist/index.js"
         }
     },
+    "funding": {
+        "type": "github",
+        "url": "https://github.com/sponsors/vinikjkkj"
+    },
+    "sideEffects": false,
+    "files": [
+        "dist",
+        "src",
+        "README.md",
+        "LICENSE"
+    ],
+    "engines": {
+        "node": ">=18"
+    },
     "scripts": {
         "build": "tsc -p tsconfig.build.json",
+        "clean": "rimraf dist",
+        "prebuild": "npm run clean",
         "typecheck": "tsc",
         "test": "node --import tsx --test test/*.test.ts",
-        "format": "prettier --write \"{src,test}/**/*.ts\"",
-        "format:check": "prettier --check \"{src,test}/**/*.ts\""
+        "test:roundtrip": "node --import tsx --test test/roundtrip.test.ts",
+        "test:interop": "node --import tsx --test test/interop.test.ts",
+        "test:equivalence": "node --import tsx --test test/equivalence.test.ts",
+        "bench": "tsx bench/bench.ts",
+        "format": "prettier --write \"{src,test,bench}/**/*.ts\"",
+        "format:check": "prettier --check \"{src,test,bench}/**/*.ts\"",
+        "check": "npm run format:check && npm run typecheck && npm test",
+        "prepublishOnly": "npm run check && npm run build"
     },
     "devDependencies": {
         "@types/node": "^25.6.0",
         "argo-graphql": "^1.1.1",
+        "graphql": "^16.13.2",
         "prettier": "^3.2.0",
+        "rimraf": "^5.0.0",
         "tsx": "^4.7.0",
         "typescript": "^5.4.0"
     }

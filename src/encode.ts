@@ -47,8 +47,7 @@ interface BlockState {
 const TEXT_ENC = new TextEncoder()
 
 class Encoder {
-    blocks = new Map<string, BlockState>()
-    blockOrder: string[] = []
+    blocks = new Map<string, BlockState>() // insertion order = first-write order
     core = new Buf(1024)
     flags = 0
     inline = false
@@ -57,7 +56,7 @@ class Encoder {
     selfDescribingErrors = false
     selfDescribing = false
 
-    constructor(wire: Wire, opts: EncodeOptions) {
+    constructor(opts: EncodeOptions) {
         if (opts.inlineEverything) {
             this.flags |= FLAG_INLINE_EVERYTHING
             this.inline = true
@@ -79,60 +78,32 @@ class Encoder {
             this.nullTerminated = true
         }
         if (opts.noDeduplication) this.flags |= FLAG_NO_DEDUPLICATION
-        walkBlocks(wire, this)
     }
-}
 
-// Pre-walk wire schema and register blocks in deterministic order.
-function walkBlocks(t: Wire, enc: Encoder, seenKeys: Set<string> = new Set()): void {
-    switch (t.type) {
-        case 'BLOCK':
-            registerBlock(enc, t.key, t.dedupe, seenKeys)
-            walkBlocks(t.of, enc, seenKeys)
-            return
-        case 'NULLABLE':
-        case 'ARRAY':
-            walkBlocks(t.of, enc, seenKeys)
-            return
-        case 'RECORD':
-            for (const f of t.fields) walkBlocks(f.of, enc, seenKeys)
-            return
-        case 'DESC':
-            // DESC may use any of the four implicit blocks.
-            registerBlock(enc, 'String', true, seenKeys)
-            registerBlock(enc, 'Bytes', true, seenKeys)
-            registerBlock(enc, 'Int', false, seenKeys)
-            registerBlock(enc, 'Float', false, seenKeys)
-            return
-        case 'PATH':
-            // PATH uses inline VARINTs (no block) per its definition (ARRAY of VARINT).
-            return
-        default:
-            return
+    block(key: string, dedupe: boolean): BlockState {
+        let b = this.blocks.get(key)
+        if (b) return b
+        b = {
+            buf: this.inline ? this.core : new Buf(256),
+            dedupe,
+            seen: new Map(),
+            nextId: BACKREF_BASE
+        }
+        this.blocks.set(key, b)
+        return b
     }
-}
-
-function registerBlock(enc: Encoder, key: string, dedupe: boolean, seen: Set<string>) {
-    if (seen.has(key) || enc.blocks.has(key)) return
-    seen.add(key)
-    const buf = enc.inline ? enc.core : new Buf(256)
-    enc.blocks.set(key, { buf, dedupe, seen: new Map(), nextId: BACKREF_BASE })
-    enc.blockOrder.push(key)
 }
 
 function bytesKey(b: Uint8Array): string {
-    // Latin1 round-trip: each byte becomes one UTF-16 code unit. Cheap and unique.
     let s = ''
     for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i])
     return s
 }
 
-// ---- Value encoding ----
-
 function writeValue(enc: Encoder, t: Wire, v: unknown, block: BlockState | null): void {
     switch (t.type) {
         case 'BLOCK':
-            writeValue(enc, t.of, v, enc.blocks.get(t.key)!)
+            writeValue(enc, t.of, v, enc.block(t.key, t.dedupe))
             return
 
         case 'NULLABLE': {
@@ -142,12 +113,10 @@ function writeValue(enc: Encoder, t: Wire, v: unknown, block: BlockState | null)
             }
             if (v instanceof FieldErrorSentinel) {
                 if (enc.outOfBand) {
-                    // OutOfBandFieldErrors: write Null (not propagating extra error data here).
                     enc.core.label(LABEL_NULL)
                     return
                 }
                 enc.core.label(LABEL_ERROR)
-                // Write ARRAY of Error values inline.
                 enc.core.label(v.errors.length)
                 for (const e of v.errors) writeErrorValue(enc, e)
                 return
@@ -196,10 +165,10 @@ function writeValue(enc: Encoder, t: Wire, v: unknown, block: BlockState | null)
         }
 
         case 'VARINT': {
-            // Values can collide with backref space if dedupe is enabled, so we never
-            // dedupe VARINTs for safety (matches the spec's default of dedupe=false).
-            if (typeof v === 'bigint') enc.core.labelBig(v)
-            else enc.core.label(v as number)
+            // Reference-compatible: VARINT data lives in its block (zig-zag varint),
+            // nothing in core. Dedup unsupported for VARINT (collides with backref space).
+            if (typeof v === 'bigint') block!.buf.labelBig(v)
+            else block!.buf.label(v as number)
             return
         }
 
@@ -256,6 +225,12 @@ function writeValue(enc: Encoder, t: Wire, v: unknown, block: BlockState | null)
     }
 }
 
+// DESC implicit blocks. Per ref: String/Bytes dedupe by default; Int/Float don't.
+const DESC_STRING_BLOCK_DEDUPE = true
+const DESC_BYTES_BLOCK_DEDUPE = true
+const DESC_INT_BLOCK_DEDUPE = false
+const DESC_FLOAT_BLOCK_DEDUPE = false
+
 function writeDesc(enc: Encoder, v: unknown): void {
     if (v === null || v === undefined) {
         enc.core.label(DESC_NULL)
@@ -271,26 +246,31 @@ function writeDesc(enc: Encoder, v: unknown): void {
     }
     if (typeof v === 'string') {
         enc.core.label(DESC_STRING)
-        writeStringInBlock(enc, v, 'String')
+        const block = enc.block('String', DESC_STRING_BLOCK_DEDUPE)
+        writeStringInBlock(enc, v, block)
         return
     }
     if (v instanceof Uint8Array) {
         enc.core.label(DESC_BYTES)
-        writeBytesInBlock(enc, v, 'Bytes')
+        const block = enc.block('Bytes', DESC_BYTES_BLOCK_DEDUPE)
+        writeBytesInBlock(enc, v, block)
         return
     }
     if (typeof v === 'bigint') {
         enc.core.label(DESC_INT)
-        enc.core.labelBig(v)
+        const block = enc.block('Int', DESC_INT_BLOCK_DEDUPE)
+        block.buf.labelBig(v)
         return
     }
     if (typeof v === 'number') {
         if (Number.isInteger(v)) {
             enc.core.label(DESC_INT)
-            enc.core.label(v)
+            const block = enc.block('Int', DESC_INT_BLOCK_DEDUPE)
+            block.buf.label(v)
         } else {
             enc.core.label(DESC_FLOAT)
-            enc.blocks.get('Float')!.buf.f64(v)
+            const block = enc.block('Float', DESC_FLOAT_BLOCK_DEDUPE)
+            block.buf.f64(v)
         }
         return
     }
@@ -305,9 +285,10 @@ function writeDesc(enc: Encoder, v: unknown): void {
         const keys = Object.keys(obj)
         enc.core.label(DESC_OBJECT)
         enc.core.label(keys.length)
+        const stringBlock = enc.block('String', DESC_STRING_BLOCK_DEDUPE)
         for (const k of keys) {
-            // Field name: STRING (uses "String" block) with NO type marker.
-            writeStringInBlock(enc, k, 'String')
+            // Field name: STRING with NO type marker.
+            writeStringInBlock(enc, k, stringBlock)
             writeDesc(enc, obj[k])
         }
         return
@@ -315,8 +296,7 @@ function writeDesc(enc: Encoder, v: unknown): void {
     throw new Error(`DESC: unsupported value of type ${typeof v}`)
 }
 
-function writeStringInBlock(enc: Encoder, s: string, key: string) {
-    const block = enc.blocks.get(key)!
+function writeStringInBlock(enc: Encoder, s: string, block: BlockState) {
     if (block.dedupe) {
         const id = block.seen.get(s)
         if (id !== undefined) {
@@ -331,8 +311,7 @@ function writeStringInBlock(enc: Encoder, s: string, key: string) {
     if (block.dedupe) block.seen.set(s, block.nextId--)
 }
 
-function writeBytesInBlock(enc: Encoder, b: Uint8Array, key: string) {
-    const block = enc.blocks.get(key)!
+function writeBytesInBlock(enc: Encoder, b: Uint8Array, block: BlockState) {
     let kk: string | null = null
     if (block.dedupe) {
         kk = bytesKey(b)
@@ -352,17 +331,12 @@ function writeErrorValue(enc: Encoder, e: ArgoError): void {
         writeDesc(enc, errorToObject(e))
         return
     }
-    // Write as ERROR_WIRE record. Path needs to be transformed to wire path
-    // relative to the propagation point. Here we pass the path as-is — caller
-    // is responsible for making it relative.
     const obj: Record<string, unknown> = {
         message: e.message,
         location: e.location ?? null,
         path: e.path ?? null,
         extensions: e.extensions
     }
-    // If path is provided as strings/numbers, the user must have already converted
-    // to wire-path form (numbers only). Otherwise we leave as-is and trust the user.
     writeValue(enc, ERROR_WIRE, obj, null)
 }
 
@@ -374,19 +348,17 @@ function errorToObject(e: ArgoError): Record<string, unknown> {
     return o
 }
 
-// ---- Public API ----
-
 export function encode(wire: Wire, value: unknown, opts: EncodeOptions = {}): Uint8Array {
-    const enc = new Encoder(wire, opts)
+    const enc = new Encoder(opts)
     if (enc.selfDescribing) writeDesc(enc, value)
     else writeValue(enc, wire, value, null)
 
-    // Assemble: header + (each block: label(len) + data)* + (label(coreLen) + core)
+    // Header (BitSet) + each block (label(len) + data) + core (label(coreLen) + data).
+    // In inline mode, all data already lives in core; only the header is emitted before it.
     const out = new Buf(64 + enc.core.pos)
-    out.uvarint(enc.flags)
+    out.bitset(enc.flags)
     if (!enc.inline) {
-        for (const key of enc.blockOrder) {
-            const b = enc.blocks.get(key)!
+        for (const b of enc.blocks.values()) {
             const data = b.buf.view0()
             out.label(data.length)
             out.bytes(data)
