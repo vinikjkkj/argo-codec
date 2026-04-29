@@ -1,6 +1,6 @@
 {
     "name": "argo-codec",
-    "version": "0.1.1",
+    "version": "0.2.0",
     "description": "Fast, zero-copy TypeScript implementation of the Argo binary serialization format for GraphQL.",
     "keywords": [
         "argo",
@@ -22,12 +22,14 @@
     },
     "homepage": "https://github.com/vinikjkkj/argo-codec#readme",
     "type": "module",
-    "main": "./dist/index.js",
-    "types": "./dist/index.d.ts",
+    "main": "./dist/cjs/index.js",
+    "module": "./dist/esm/index.js",
+    "types": "./dist/esm/index.d.ts",
     "exports": {
         ".": {
-            "types": "./dist/index.d.ts",
-            "import": "./dist/index.js"
+            "types": "./dist/esm/index.d.ts",
+            "import": "./dist/esm/index.js",
+            "require": "./dist/cjs/index.js"
         }
     },
     "funding": {
@@ -45,7 +47,10 @@
         "node": ">=18"
     },
     "scripts": {
-        "build": "tsc -p tsconfig.build.json",
+        "build": "npm run build:esm && npm run build:cjs && npm run build:cjs:pkg",
+        "build:esm": "tsc -p tsconfig.build.json",
+        "build:cjs": "tsc -p tsconfig.cjs.json",
+        "build:cjs:pkg": "node scripts/postbuild.mjs",
         "clean": "rimraf dist",
         "prebuild": "npm run clean",
         "typecheck": "tsc",

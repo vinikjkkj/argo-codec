@@ -6,7 +6,7 @@ Fast, zero-copy TypeScript implementation of [Argo](https://msolomon.github.io/a
 - Zero-copy on decode for `BYTES` (returned as a `Uint8Array` view aliasing the source buffer).
 - ~3.6× faster encode and ~9.7× faster decode than the reference `argo-graphql` package on real-world payloads (see [Benchmarks](#benchmarks)).
 - Validated against the reference implementation: 144 e2e equivalence tests across all 7 header-mode combinations.
-- No runtime dependencies. Single ESM package, ~5 source files, ~830 LOC.
+- No runtime dependencies. Dual ESM + CommonJS build, ships TypeScript types.
 
 ## Install
 
@@ -181,6 +181,8 @@ Three test suites:
 - **roundtrip** (`test/roundtrip.test.ts`) — 14 self-roundtrip tests covering every wire type and mode combination.
 - **interop** (`test/interop.test.ts`) — 9 byte-equal cross-impl tests against the reference encoder/decoder.
 - **equivalence** (`test/equivalence.test.ts`) — 144 e2e tests decoding the reference's Star Wars + GitHub fixtures across all 8 header-mode permutations (`18`, `1a`, `1c`, `1e`, `38`, `58`, `98`, `9840`).
+
+The fixtures under `test/fixtures/` (`*.graphql`, `*.json`, `*.argo`, `*.wire`) and the test harness pattern were ported from the reference [`argo-graphql`](https://github.com/msolomon/argo) repository.
 
 ```bash
 npm test
